@@ -167,22 +167,50 @@ async def stdio_client(server: StdioServerParameters, errlog: TextIO = sys.stder
         except anyio.ClosedResourceError:
             await anyio.lowlevel.checkpoint()
 
-    async with (
-        anyio.create_task_group() as tg,
-        process,
-    ):
-        tg.start_soon(stdout_reader)
-        tg.start_soon(stdin_writer)
+        # FIX FOR ISSUE #577: 
+    # The issue occurs when clients are closed in FIFO order (first created, first cleaned up).
+    # This can cause "Attempted to exit cancel scope in a different task" errors.
+    #
+    # The solution is to simplify our resource management with these key improvements:
+    # 1. Use a single flattened async context manager structure with proper nesting
+    # 2. Cancel tasks BEFORE closing streams to properly handle task cleanup
+    # 3. Add explicit error handling to ensure resources are always cleaned up properly
+    # 4. Maintain proper cleanup order: cancel tasks, close streams, terminate process
+    async with process, \
+              anyio.create_task_group() as task_group:
+            
+        # Start our reader/writer tasks in the task group context
+        task_group.start_soon(stdout_reader)
+        task_group.start_soon(stdin_writer)
+        
         try:
+            # This is where the context manager yields control to the caller
             yield read_stream, write_stream
         finally:
-            # Clean up process to prevent any dangling orphaned processes
-            if sys.platform == "win32":
-                await terminate_windows_process(process)
-            else:
-                process.terminate()
-            await read_stream.aclose()
-            await write_stream.aclose()
+            # Proper cleanup order is critical
+            # First cancel any pending operations by cancelling the task group
+            # This prevents the issue with cancellation scopes in different tasks
+            task_group.cancel_scope.cancel()
+            
+            # Then close the streams to prevent further I/O
+            try:
+                await read_stream.aclose()
+            except Exception:
+                pass
+            
+            try:
+                await write_stream.aclose()
+            except Exception:
+                pass
+                
+            # Finally terminate the process if needed
+            try:
+                if sys.platform == "win32":
+                    await terminate_windows_process(process)
+                else:
+                    process.terminate()
+            except Exception:
+                pass
 
 
 def _get_executable_command(command: str) -> str:
